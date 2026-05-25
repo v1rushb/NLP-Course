@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 import re
@@ -7,6 +8,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -19,10 +21,13 @@ DEFAULT_MAX_RESULTS = int(os.getenv("PPU_KNOWLEDGE_MAX_RESULTS", "5"))
 DEFAULT_MIN_SCORE = float(os.getenv("PPU_KNOWLEDGE_MIN_SCORE", "2.0"))
 SYNC_INTERVAL_SECONDS = int(os.getenv("PPU_KNOWLEDGE_SYNC_INTERVAL_SECONDS", "300"))
 INDEX_VERSION = "arabic-normalization-v2"
+ELASTICSEARCH_INDEX_VERSION = "v1"
 
 _last_sync_at = 0.0
 _sync_in_progress = False
 _sync_lock = threading.Lock()
+_es_client: Any | None = None
+_es_unavailable_until = 0.0
 
 ARABIC_STOPWORDS = {
     "انا", "انت", "انتي", "هو", "هي", "هم", "هن", "هذا", "هذه", "ذلك", "تلك",
@@ -98,7 +103,15 @@ def _run_background_sync() -> None:
         from db.database import SessionLocal
 
         with SessionLocal() as db:
-            sync_pdf_knowledge(db)
+            sync_pdf_knowledge(db, sync_elasticsearch=False)
+            if _elastic_enabled():
+                retries = _env_int("ELASTICSEARCH_STARTUP_SYNC_RETRIES", 12)
+                delay = _env_float("ELASTICSEARCH_STARTUP_RETRY_SECONDS", 5.0)
+                for attempt in range(retries):
+                    if sync_elasticsearch_knowledge(db):
+                        break
+                    if attempt < retries - 1:
+                        time.sleep(delay)
             _last_sync_at = time.time()
     except Exception:
         logger.exception("Background PPU PDF knowledge indexing failed")
@@ -107,7 +120,7 @@ def _run_background_sync() -> None:
             _sync_in_progress = False
 
 
-def sync_pdf_knowledge(db: Session) -> int:
+def sync_pdf_knowledge(db: Session, sync_elasticsearch: bool = True) -> int:
     data_dir = _data_dir()
     if not data_dir.exists():
         logger.warning("PPU knowledge data directory was not found: %s", data_dir)
@@ -123,8 +136,38 @@ def sync_pdf_knowledge(db: Session) -> int:
         indexed += _sync_pdf(db, pdf_path)
 
     db.commit()
+    if sync_elasticsearch:
+        sync_elasticsearch_knowledge(db)
     logger.info("PPU PDF knowledge index ready chunks=%s data_dir=%s", indexed, data_dir)
     return indexed
+
+
+def sync_elasticsearch_knowledge(db: Session) -> bool:
+    client = _elastic_client()
+    if client is None:
+        return False
+
+    rows = db.scalars(select(PpuKnowledgeChunk).order_by(PpuKnowledgeChunk.id)).all()
+    if not rows:
+        return False
+
+    try:
+        _ensure_elastic_index(client)
+        _clear_elastic_index(client)
+        batch_size = _env_int("ELASTICSEARCH_SYNC_BATCH_SIZE", 500)
+        for start in range(0, len(rows), batch_size):
+            _bulk_index_elastic(client, rows[start:start + batch_size])
+        response = client.post(
+            _elastic_url(f"/{_elastic_index()}/_refresh"),
+            timeout=_env_float("ELASTICSEARCH_TIMEOUT_SECONDS", 2.0),
+        )
+        response.raise_for_status()
+        logger.info("Elasticsearch knowledge index synced chunks=%s index=%s", len(rows), _elastic_index())
+        return True
+    except Exception:
+        _mark_elastic_unavailable()
+        logger.exception("Elasticsearch knowledge sync failed; SQL knowledge search remains available")
+        return False
 
 
 def search_knowledge(
@@ -139,6 +182,10 @@ def search_knowledge(
     tokens = _keywords(query_norm)
     if not tokens:
         return []
+
+    elastic_hits = _search_elasticsearch(query, query_norm, tokens, limit or DEFAULT_MAX_RESULTS)
+    if elastic_hits:
+        return elastic_hits
 
     rows = db.scalars(select(PpuKnowledgeChunk)).all()
     hits: list[KnowledgeHit] = []
@@ -168,6 +215,63 @@ def format_knowledge_context(hits: list[KnowledgeHit]) -> str:
             f"[{index}] المصدر: {hit.source}{page}\n{_trim(hit.text, 1400)}"
         )
     return "\n\n".join(sections)
+
+
+def _search_elasticsearch(
+    query: str,
+    query_norm: str,
+    tokens: list[str],
+    limit: int,
+) -> list[KnowledgeHit]:
+    client = _elastic_client()
+    if client is None:
+        return []
+
+    keyword_query = " ".join(tokens)
+    should = [
+        {"match_phrase": {"search_text": {"query": query_norm, "boost": 5}}},
+        {"match": {"search_text": {"query": keyword_query, "operator": "and", "boost": 4}}},
+        {"match": {"text": {"query": query, "operator": "and", "boost": 3}}},
+        {
+            "multi_match": {
+                "query": keyword_query,
+                "fields": ["search_text^3", "text^2", "source"],
+                "type": "best_fields",
+                "minimum_should_match": "60%",
+            }
+        },
+    ]
+
+    try:
+        response = client.post(
+            _elastic_url(f"/{_elastic_index()}/_search"),
+            json={
+                "size": limit,
+                "query": {"bool": {"should": should, "minimum_should_match": 1}},
+                "_source": ["source", "page", "text"],
+            },
+            timeout=_env_float("ELASTICSEARCH_TIMEOUT_SECONDS", 2.0),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        _mark_elastic_unavailable()
+        logger.exception("Elasticsearch knowledge search failed; falling back to SQL search")
+        return []
+
+    hits: list[KnowledgeHit] = []
+    for hit in payload.get("hits", {}).get("hits", []):
+        source = hit.get("_source") or {}
+        text = source.get("text") or ""
+        if not text:
+            continue
+        hits.append(KnowledgeHit(
+            source=source.get("source") or "Elasticsearch",
+            page=source.get("page"),
+            text=text,
+            score=float(hit.get("_score") or 0),
+        ))
+    return hits
 
 
 def _sync_pdf(db: Session, pdf_path: Path) -> int:
@@ -205,6 +309,151 @@ def _sync_pdf(db: Session, pdf_path: Path) -> int:
 
     logger.info("Indexed PPU PDF source=%s chunks=%s", source, len(chunks))
     return len(chunks)
+
+
+def _elastic_client():
+    if not _elastic_enabled():
+        return None
+
+    global _es_client
+    if _es_client is not None:
+        return _es_client
+
+    if time.time() < _es_unavailable_until:
+        return None
+
+    try:
+        import requests
+
+        client = requests.Session()
+        response = client.get(
+            _elastic_url("/_cluster/health"),
+            timeout=_env_float("ELASTICSEARCH_TIMEOUT_SECONDS", 2.0),
+        )
+        response.raise_for_status()
+        _es_client = client
+        return _es_client
+    except Exception:
+        _mark_elastic_unavailable()
+        logger.warning("Elasticsearch is not reachable yet; using SQL knowledge search")
+        return None
+
+
+def _ensure_elastic_index(client) -> None:
+    index = _elastic_index()
+    response = client.head(
+        _elastic_url(f"/{index}"),
+        timeout=_env_float("ELASTICSEARCH_TIMEOUT_SECONDS", 2.0),
+    )
+    if response.status_code == 200:
+        return
+    if response.status_code != 404:
+        response.raise_for_status()
+
+    response = client.put(
+        _elastic_url(f"/{index}"),
+        json={
+            "settings": {
+                "number_of_shards": 1,
+                "number_of_replicas": 0,
+                "analysis": {
+                    "analyzer": {
+                        "ppu_arabic": {
+                            "type": "custom",
+                            "tokenizer": "standard",
+                            "filter": ["lowercase", "decimal_digit", "arabic_normalization", "arabic_stop", "arabic_stemmer"],
+                        }
+                    },
+                    "filter": {
+                        "arabic_stop": {"type": "stop", "stopwords": "_arabic_"},
+                        "arabic_stemmer": {"type": "stemmer", "language": "arabic"},
+                    },
+                },
+            },
+            "mappings": {
+                "properties": {
+                    "chunk_id": {"type": "integer"},
+                    "source": {"type": "keyword"},
+                    "source_path": {"type": "keyword", "index": False},
+                    "file_hash": {"type": "keyword"},
+                    "page": {"type": "integer"},
+                    "chunk_index": {"type": "integer"},
+                    "text": {
+                        "type": "text",
+                        "analyzer": "ppu_arabic",
+                        "fields": {"standard": {"type": "text", "analyzer": "standard"}},
+                    },
+                    "search_text": {"type": "text", "analyzer": "standard"},
+                    "indexed_at": {"type": "date"},
+                    "index_version": {"type": "keyword"},
+                }
+            },
+        },
+        timeout=_env_float("ELASTICSEARCH_TIMEOUT_SECONDS", 2.0),
+    )
+    response.raise_for_status()
+
+
+def _clear_elastic_index(client) -> None:
+    response = client.post(
+        _elastic_url(f"/{_elastic_index()}/_delete_by_query"),
+        params={"conflicts": "proceed", "refresh": "true"},
+        json={"query": {"match_all": {}}},
+        timeout=_env_float("ELASTICSEARCH_TIMEOUT_SECONDS", 2.0),
+    )
+    response.raise_for_status()
+
+
+def _bulk_index_elastic(client, rows: list[PpuKnowledgeChunk]) -> None:
+    now = int(time.time() * 1000)
+    lines: list[str] = []
+    for row in rows:
+        lines.append(json.dumps({"index": {"_index": _elastic_index(), "_id": row.id}}))
+        lines.append(json.dumps(
+            {
+                "chunk_id": row.id,
+                "source": row.source,
+                "source_path": row.source_path,
+                "file_hash": row.file_hash,
+                "page": row.page,
+                "chunk_index": row.chunk_index,
+                "text": row.text,
+                "search_text": row.search_text,
+                "indexed_at": now,
+                "index_version": ELASTICSEARCH_INDEX_VERSION,
+            },
+            ensure_ascii=False,
+        ))
+
+    response = client.post(
+        _elastic_url("/_bulk"),
+        data=("\n".join(lines) + "\n").encode("utf-8"),
+        headers={"Content-Type": "application/x-ndjson"},
+        timeout=_env_float("ELASTICSEARCH_TIMEOUT_SECONDS", 2.0),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("errors"):
+        raise RuntimeError("Elasticsearch bulk indexing reported item errors")
+
+
+def _elastic_enabled() -> bool:
+    return _truthy(os.getenv("ELASTICSEARCH_ENABLED", "false"))
+
+
+def _elastic_index() -> str:
+    return os.getenv("ELASTICSEARCH_INDEX", "ppu_knowledge")
+
+
+def _elastic_url(path: str) -> str:
+    base = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200").rstrip("/")
+    return f"{base}/{path.lstrip('/')}"
+
+
+def _mark_elastic_unavailable() -> None:
+    global _es_client, _es_unavailable_until
+    _es_client = None
+    _es_unavailable_until = time.time() + _env_float("ELASTICSEARCH_RETRY_AFTER_SECONDS", 15.0)
 
 
 def _extract_chunks(pdf_path: Path) -> list[tuple[int | None, str]]:
@@ -373,3 +622,17 @@ def _trim(text: str, max_chars: int) -> str:
 
 def _truthy(value: str | None) -> bool:
     return (value or "").lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default

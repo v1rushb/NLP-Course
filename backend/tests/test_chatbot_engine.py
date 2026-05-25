@@ -15,7 +15,9 @@ from services.knowledge_base import normalize_for_search
 class ChatbotEngineTest(unittest.TestCase):
     def setUp(self):
         self.original_auto_index = os.environ.get("PPU_KNOWLEDGE_AUTO_INDEX")
+        self.original_elasticsearch_enabled = os.environ.get("ELASTICSEARCH_ENABLED")
         os.environ["PPU_KNOWLEDGE_AUTO_INDEX"] = "false"
+        os.environ["ELASTICSEARCH_ENABLED"] = "false"
         init_db()
         self.db = SessionLocal()
         seed_db(self.db)
@@ -58,6 +60,10 @@ class ChatbotEngineTest(unittest.TestCase):
             os.environ.pop("PPU_KNOWLEDGE_AUTO_INDEX", None)
         else:
             os.environ["PPU_KNOWLEDGE_AUTO_INDEX"] = self.original_auto_index
+        if self.original_elasticsearch_enabled is None:
+            os.environ.pop("ELASTICSEARCH_ENABLED", None)
+        else:
+            os.environ["ELASTICSEARCH_ENABLED"] = self.original_elasticsearch_enabled
 
     def enroll(self, course, grade=None):
         self.db.add(Enrollment(user_id=self.user.id, course_id=course.id, grade=grade))
